@@ -1,0 +1,23 @@
+[package]
+name = "veritas-sdk"
+version = { workspace = true }
+edition = "2021"
+
+[features]
+debug-graph = []
+swaps-only = []
+
+[lints]
+workspace = true
+
+[dependencies]
+step-ingestooor-sdk = { workspace = true }
+petgraph = { workspace = true }
+tokio = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+clickhouse = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+log = { workspace = true }
+primitive-types = { workspace = true }

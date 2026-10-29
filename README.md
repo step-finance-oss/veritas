@@ -1,0 +1,234 @@
+> **Historical reference snapshot**
+>
+> This source is preserved for study and reuse. It is not maintained or verified
+> to build or run with current dependencies. Historical instructions below may
+> rely on unavailable services, repositories or infrastructure. CI configuration,
+> private key files and private contact/service references have been removed where present.
+>
+> Original Step Finance contributions are licensed under [MIT](LICENSE).
+> Existing third-party attribution and dependency licenses remain applicable;
+> see [third-party notices](THIRD_PARTY_NOTICES.md).
+
+# Rust Project Documentation
+
+## Token Pricing Derivation
+
+The pricing engine in this Rust program derives token prices using a graph-based approach. The core component is the `MintPricingGraph`, which is a directed graph where nodes represent tokens (mints) and edges represent relationships between these tokens.
+
+### Key Components
+
+- **MintNode:** Each node in the graph represents a token and contains information about the token's mint and its USD price. The price can be sourced directly from an oracle or derived through relationships with other nodes in the graph.
+
+- **MintEdge:** Each edge represents a relationship between two tokens, capturing details such as the relationship ID, whether the relationship data is up-to-date, and the last update time. The edge also holds a `LiqRelation`, which likely contains liquidity-related data.
+
+- **USDPriceWithSource:** This enum indicates the source of the USD price for a token. It can either be directly from an oracle or derived through relationships with other nodes in the graph.
+
+### Pricing Mechanism
+
+1. **Oracle Pricing:** If available, the price of a token is directly obtained from an oracle, providing a reliable and up-to-date price.
+
+2. **Relation-Based Pricing:** If oracle data is not available, the price is derived through relationships with other tokens in the graph. This involves traversing the graph and using the `LiqRelation` data to calculate the price based on liquidity and other factors.
+
+This graph-based approach allows the program to efficiently manage and update token prices, leveraging both direct oracle data and complex inter-token relationships to ensure accurate pricing.
+
+### BFS Recalculation
+
+The `bfs_recalculate` function is a key component of the pricing engine, responsible for traversing the `MintPricingGraph` to update token prices. It uses a breadth-first search (BFS) approach to visit each node (token) in the graph, recalculating prices based on relationships with other tokens.
+
+- **Oracle Check:** The function first checks if a token's price is directly available from an oracle. If so, it skips recalculating the price but continues to traverse the graph.
+
+- **Price Calculation:** For tokens without direct oracle prices, the function calculates a new price using the `get_total_weighted_price` function, which aggregates prices from related tokens.
+
+- **Price Update:** If the new price differs significantly from the current price, the function updates the token's price and emits a notification (dooot) for further processing.
+
+This mechanism ensures that token prices are consistently updated, leveraging both direct oracle data and derived prices from the graph's relationships.
+
+## Crates
+
+### SDK Crate
+
+The `sdk` crate is a library that provides core functionalities and utilities for the project. It is structured as follows:
+
+- **Modules:**
+  - `constants`: Contains constant values used throughout the SDK.
+  - `ppl_graph`: Manages graph-related functionalities.
+    - `graph.rs`: Implements graph algorithms and data structures.
+    - `structs.rs`: Defines the structures used in graph operations.
+  - `utils`: Provides utility functions and helpers.
+
+### Engine Crate
+
+The `engine` crate is another component of the project, though its specific functionalities are not detailed in this document.
+
+#### API Endpoints
+
+The engine crate provides several HTTP endpoints through an Axum server running on port 3000:
+
+- **Health Check**
+
+  - Endpoint: `/healthcheck`
+  - Method: GET
+  - Returns: 200 OK if service is ready, 503 Service Unavailable during bootstrap
+
+- **Control Endpoints**
+
+  - `/toggle-ingestion`: Toggle the ingestion of new data from AMQP
+    - Method: POST
+    - Returns: JSON response with the new state
+      ```json
+      {
+        "ingesting": true // true if ingesting, false if paused
+      }
+      ```
+  - `/toggle-calculation`: Toggle the calculation of prices
+    - Method: POST
+    - Returns: JSON response with the new state
+      ```json
+      {
+        "calculating": true // true if calculating new prices, false if paused
+      }
+      ```
+
+- **Debug and State Endpoints**
+
+  - `/debug-node`: Get detailed information about a specific node in the pricing graph
+
+    - Method: GET
+    - Query Parameters:
+      - `mint` (required): The mint address of the token to get information about
+      - `only_incoming` (optional): Filter to show only incoming relations (default: false)
+      - `only_outgoing` (optional): Filter to show only outgoing relations (default: false)
+      - `only_acceptable` (optional): Filter to show only relations with acceptable price impact (default: false)
+      - `custom_price_impact` (optional): Override the default price impact threshold with a custom decimal value (e.g. "0.01" for 1%)
+    - Example Requests:
+      ```bash
+      # Get all relations for a token
+      curl "http://localhost:3000/debug-node?mint=So11111111111111111111111111111111111111112"
+      # Get only incoming relations
+      curl "http://localhost:3000/debug-node?mint=So11111111111111111111111111111111111111112&only_incoming=true"
+      # Get only outgoing relations with acceptable price impact
+      curl "http://localhost:3000/debug-node?mint=So11111111111111111111111111111111111111112&only_outgoing=true&only_acceptable=true"
+      # Get relations with custom price impact threshold of 0.5%
+      curl "http://localhost:3000/debug-node?mint=So11111111111111111111111111111111111111112&only_acceptable=true&custom_price_impact=0.005"
+      ```
+    - Response includes:
+      - Token mint address
+      - Calculated price
+      - Neighbor tokens and their relations
+      - For each relation:
+        - Liquidity amount
+        - Liquidity levels
+        - Derived price
+
+  - `/diagnose-mint`: Get diagnostic information about a specific mint token
+
+    - Method: GET
+    - Query Parameters:
+      - `mint` (required): The mint address of the token to diagnose
+    - Example Request:
+      ```bash
+      curl "http://localhost:3000/diagnose-mint?mint=So11111111111111111111111111111111111111112"
+      ```
+    - Returns: JSON with diagnostic information about the mint:
+      ```json
+      {
+        "mint": "So11111111111111111111111111111111111111112",
+        "in_num_pools": 5,
+        "decimals": 9,
+        "pools": [
+          {
+            "pk": "pool_identifier",
+            "underlyings": [...],
+            "liquidity": {...}
+          }
+        ]
+      }
+      ```
+    - Response includes:
+      - Token mint address
+      - Number of liquidity pools the token is in
+      - Token decimal precision (if available)
+      - List of all liquidity pools containing this token with their details
+
+  - `/lp-cache`: Query liquidity pool cache information
+
+    - Method: GET
+    - Query Parameters:
+      - `pool` (required): The pool identifier
+    - Returns: JSON with liquidity pool details or 404 if not found
+
+  - `/decimal-cache`: Retrieve decimal precision information for tokens
+
+    - Method: GET
+    - Query Parameters:
+      - `mint` (required): The mint address of the token
+    - Returns: `{ "decimal": <u8> }` or 404 if not found
+
+  - `/balance-cache`: Get token balance information from the cache
+
+    - Method: GET
+    - Query Parameters:
+      - `mint` (required): The mint address of the token
+    - Returns: One of:
+      ```json
+      { "type": "NotInMap" }
+      { "type": "InMapButNull" }
+      { "type": "BalanceExists", "balance": <u64> }
+      ```
+
+  - `/stats`: Get engine and graph statistics
+
+    - Method: GET
+    - Query Parameters:
+      - `top_n` (optional): Number of top dominator nodes to return (default: 10)
+    - Returns: JSON with engine and graph stats, e.g.
+      ```json
+      {
+        "ingesting": true,
+        "calculating": true,
+        "node_count": 123,
+        "edge_count": 456,
+        "top_dominators": [
+          ["mint1", 12],
+          ["mint2", 10]
+        ]
+      }
+      ```
+
+  - `/force-recalc`: Force recalculation of prices in the graph
+    - Method: POST
+    - Request Body (JSON, optional):
+      - `update_nodes` (bool, optional): Whether to update nodes in the graph (default: false)
+      - `start_mint` (string, optional): Mint address to start recalculation from (default: WSOL_MINT)
+    - Returns: JSON map of updated token prices:
+      ```json
+      {
+        "<mint_address>": "<price_decimal>",
+        ...
+      }
+      ```
+
+Each endpoint provides access to internal state and debugging information about the pricing engine's operation.
+
+## Dependencies
+
+The project relies on several external crates, including but not limited to:
+
+- `tokio`: For asynchronous programming.
+- `serde` and `serde_json`: For serialization and deserialization.
+- `lapin`: For AMQP (Advanced Message Queuing Protocol) client functionalities.
+- `solana-sdk`: For interacting with the Solana blockchain.
+
+## Building and Running
+
+To build the project, use the following command:
+
+```bash
+cargo build --release
+```
+
+To run the project, execute:
+
+```bash
+cargo run --release
+```

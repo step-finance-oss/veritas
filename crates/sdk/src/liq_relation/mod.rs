@@ -1,0 +1,301 @@
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    liq_relation::relations::{
+        clmm::get_clmm_liq_levels_dumb,
+        fixed_ref::{get_fixed_ref_liquidity, get_fixed_ref_price},
+        index_like::get_index_like_price,
+    },
+    ppl_graph::structs::{LiqAmount, LiqLevels},
+    types::{MintGraphNodeIndexType, MintPricingGraph},
+};
+
+use relations::{
+    clmm::{get_clmm_liquidity, get_clmm_price, ClmmTickMap},
+    cplp::{get_cplp_liq_levels, get_cplp_liquidity, get_cplp_price},
+    dlmm::{get_dlmm_liq_levels, get_dlmm_liquidity, get_dlmm_price, DlmmBinMap},
+    fixed::{get_fixed_liq_levels, get_fixed_liquidity, get_fixed_price},
+};
+
+pub mod relations;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IndexPart {
+    pub mint: String,
+    pub node_idx: MintGraphNodeIndexType,
+    pub decimals: u8,
+    pub ratio: Decimal,
+}
+
+/// Each variant should contain minimum information to calculate price, liquidity, and liq levels
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum LiqRelation {
+    /// Constant Product LP
+    CpLp {
+        /// Expressed in UNITS
+        amt_origin: Decimal,
+        /// Expressed in UNITS
+        amt_dest: Decimal,
+        pool_id: String,
+    },
+    /// Fixed ratio of parent to underlying, e.g., STEP -> xSTEP
+    Fixed { amt_per_parent: Decimal },
+    /// DLMMs
+    Dlmm {
+        /// Expressed in UNITS
+        amt_origin: Decimal,
+        /// Expressed in UNITS
+        amt_dest: Decimal,
+        decimals_x: u8,
+        decimals_y: u8,
+        /// (bin_arr_ix, bin_index_in_vec)
+        active_bin_account: Option<(i32, usize)>,
+        #[serde(skip)]
+        bins_by_account: DlmmBinMap,
+        is_reverse: bool,
+        pool_id: String,
+    },
+    /// CLMMs
+    Clmm {
+        amt_origin: Decimal,
+        amt_dest: Decimal,
+        decimals_a: u8,
+        decimals_b: u8,
+        #[serde(skip)]
+        ticks_by_account: ClmmTickMap,
+        current_price_x64: Option<u128>,
+        current_tick_index: Option<i32>,
+        tick_spacing: Option<i32>,
+        is_reverse: bool,
+        pool_id: String,
+    },
+    /// Index-like relations, e.g., (BTC, ETH, USDC, USDT) -> CRT
+    IndexLike {
+        market_id: String,
+        decimals_parent: u8,
+        parts: Vec<IndexPart>,
+    },
+    /// A relation that that is a fixed ratio of parent to underlying, e.g., xSTEP -> STEP,
+    /// but has weighted liquidity based on the parent's price.
+    ///
+    /// This enables tokens purely priced by Meteora AMMs to derive some price from their vTokens
+    /// See the special case in `handle_fixed` in `mint_underlyings/handle_fixed.rs`
+    FixedRef {
+        amt_parent_per_dest: Decimal,
+        /// Expressed in UNITS
+        amt_parent: Decimal,
+    },
+    // /// CLOBs
+    // Clob,
+}
+
+impl LiqRelation {
+    /// Returns `None` if unable to calculate the price of this relation (through overflows, divs by 0, etc)
+    #[inline]
+    pub fn get_price(
+        &self,
+        usd_price_origin: Decimal,
+        graph: &MintPricingGraph,
+    ) -> Option<Decimal> {
+        match self {
+            LiqRelation::CpLp {
+                amt_origin,
+                amt_dest,
+                ..
+            } => get_cplp_price(amt_origin, amt_dest, &usd_price_origin),
+            LiqRelation::Fixed { amt_per_parent } => {
+                get_fixed_price(amt_per_parent, &usd_price_origin)
+            }
+            LiqRelation::Dlmm {
+                decimals_x,
+                decimals_y,
+                bins_by_account,
+                active_bin_account,
+                is_reverse,
+                ..
+            } => get_dlmm_price(
+                *decimals_x,
+                *decimals_y,
+                &usd_price_origin,
+                bins_by_account,
+                active_bin_account,
+                *is_reverse,
+            ),
+            LiqRelation::Clmm {
+                decimals_a,
+                decimals_b,
+                current_price_x64,
+                is_reverse,
+                ..
+            } => get_clmm_price(
+                current_price_x64,
+                &usd_price_origin,
+                *decimals_a,
+                *decimals_b,
+                *is_reverse,
+            ),
+            LiqRelation::IndexLike {
+                parts,
+                market_id,
+                decimals_parent,
+            } => get_index_like_price(graph, market_id, parts, *decimals_parent),
+            LiqRelation::FixedRef {
+                amt_parent_per_dest,
+                ..
+            } => get_fixed_ref_price(&usd_price_origin, amt_parent_per_dest),
+        }
+    }
+
+    /// `tokens_origin_per_sol` is tokens_a_per_sol (aka source of the incoming relation) IN UNITS
+    #[inline]
+    pub fn get_liq_levels(&self, tokens_origin_per_sol: Decimal) -> Option<LiqLevels> {
+        match self {
+            LiqRelation::CpLp {
+                amt_origin: amt_a,
+                amt_dest: amt_b,
+                ..
+            } => get_cplp_liq_levels(amt_a, amt_b, &tokens_origin_per_sol),
+            LiqRelation::Fixed { .. } => get_fixed_liq_levels(),
+            LiqRelation::Dlmm {
+                bins_by_account,
+                active_bin_account,
+                is_reverse,
+                decimals_x,
+                decimals_y,
+                ..
+            } => get_dlmm_liq_levels(
+                bins_by_account,
+                active_bin_account,
+                &tokens_origin_per_sol,
+                *is_reverse,
+                *decimals_x,
+                *decimals_y,
+            ),
+            // LiqRelation::Clmm {
+            //     ticks_by_account,
+            //     is_reverse,
+            //     current_tick_index,
+            //     current_price_x64,
+            //     tick_spacing,
+            //     decimals_a,
+            //     decimals_b,
+            //     ..
+            // } => get_clmm_liq_levels(
+            //     ticks_by_account,
+            //     *current_tick_index,
+            //     *current_price_x64,
+            //     *tick_spacing,
+            //     &tokens_per_sol,
+            //     *is_reverse,
+            //     *decimals_a,
+            //     *decimals_b,
+            // ),
+            LiqRelation::Clmm { amt_origin, .. } => {
+                get_clmm_liq_levels_dumb(amt_origin, &tokens_origin_per_sol)
+            }
+            LiqRelation::IndexLike { .. } => Some(LiqLevels::ZERO),
+            LiqRelation::FixedRef { .. } => Some(LiqLevels::ZERO),
+        }
+    }
+
+    /// Returns `None` if unable to calculate liquidity of this relation (through overflows, divs by 0, etc)
+    #[inline]
+    pub fn get_liquidity(
+        &self,
+        price_source_usd: Decimal,
+        price_dest_usd: Decimal,
+    ) -> Option<LiqAmount> {
+        match self {
+            LiqRelation::CpLp {
+                amt_origin,
+                amt_dest,
+                ..
+            } => get_cplp_liquidity(amt_origin, amt_dest, price_source_usd, price_dest_usd),
+            LiqRelation::Fixed { .. } => get_fixed_liquidity(),
+            LiqRelation::Dlmm {
+                amt_origin: amt_a,
+                amt_dest: amt_b,
+                ..
+            } => get_dlmm_liquidity(amt_a, amt_b, price_source_usd, price_dest_usd),
+            LiqRelation::Clmm {
+                amt_origin,
+                amt_dest,
+                ..
+            } => get_clmm_liquidity(amt_origin, amt_dest, price_source_usd, price_dest_usd),
+            LiqRelation::IndexLike { .. } => Some(LiqAmount::Inf),
+            LiqRelation::FixedRef { amt_parent, .. } => {
+                get_fixed_ref_liquidity(amt_parent, &price_source_usd)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn reversed(&self) -> Self {
+        match self {
+            LiqRelation::Clmm {
+                amt_origin,
+                amt_dest,
+                decimals_a,
+                decimals_b,
+                ticks_by_account,
+                current_price_x64,
+                current_tick_index,
+                tick_spacing,
+                is_reverse,
+                pool_id,
+            } => LiqRelation::Clmm {
+                amt_dest: *amt_origin,
+                amt_origin: *amt_dest,
+                decimals_a: *decimals_a,
+                decimals_b: *decimals_b,
+                current_price_x64: *current_price_x64,
+                current_tick_index: *current_tick_index,
+                ticks_by_account: ticks_by_account.clone(),
+                tick_spacing: *tick_spacing,
+                is_reverse: !*is_reverse,
+                pool_id: pool_id.clone(),
+            },
+            LiqRelation::CpLp {
+                amt_origin,
+                amt_dest,
+                pool_id,
+            } => LiqRelation::CpLp {
+                amt_dest: *amt_origin,
+                amt_origin: *amt_dest,
+                pool_id: pool_id.clone(),
+            },
+            LiqRelation::Fixed { amt_per_parent } => LiqRelation::Fixed {
+                amt_per_parent: Decimal::ONE / amt_per_parent,
+            },
+            LiqRelation::Dlmm {
+                amt_origin,
+                amt_dest,
+                decimals_x,
+                decimals_y,
+                bins_by_account,
+                active_bin_account,
+                is_reverse,
+                pool_id,
+            } => LiqRelation::Dlmm {
+                amt_dest: *amt_origin,
+                amt_origin: *amt_dest,
+                decimals_x: *decimals_x,
+                decimals_y: *decimals_y,
+                bins_by_account: bins_by_account.clone(),
+                active_bin_account: *active_bin_account,
+                is_reverse: !*is_reverse,
+                pool_id: pool_id.clone(),
+            },
+            LiqRelation::IndexLike { .. } => self.clone(),
+            LiqRelation::FixedRef {
+                amt_parent_per_dest,
+                amt_parent,
+            } => LiqRelation::FixedRef {
+                amt_parent: *amt_parent,
+                amt_parent_per_dest: Decimal::ONE / *amt_parent_per_dest,
+            },
+        }
+    }
+}
